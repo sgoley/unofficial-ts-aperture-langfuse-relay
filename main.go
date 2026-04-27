@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -11,11 +13,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,20 +27,27 @@ import (
 )
 
 type config struct {
-	TSNetEnabled       bool
-	TSNetHostname      string
-	TSNetStateDir      string
-	TSAuthKey          string
-	ListenAddr         string
-	WebhookPath        string
-	ApertureAPIKey     string
-	LangfuseBaseURL    string
-	LangfusePublicKey  string
-	LangfuseSecretKey  string
-	LangfuseEnv        string
-	RequestTimeout     time.Duration
-	ShutdownTimeout    time.Duration
-	MaxRequestBodySize int64
+	TSNetEnabled          bool
+	TSNetTLSEnabled       bool
+	TSNetHostname         string
+	TSNetStateDir         string
+	TSAuthKey             string
+	ListenAddr            string
+	WebhookPath           string
+	ApertureAPIKey        string
+	LangfuseBaseURL       string
+	LangfusePublicKey     string
+	LangfuseSecretKey     string
+	LangfuseEnv           string
+	RequestTimeout        time.Duration
+	ShutdownTimeout       time.Duration
+	MaxRequestBodySize    int64
+	MaxLangfuseBatchBytes int64
+	QueueSize             int
+	WorkerCount           int
+	RetryMaxAttempts      int
+	RetryBaseDelay        time.Duration
+	RetryMaxDelay         time.Duration
 }
 
 type aperturePayload struct {
@@ -87,10 +98,12 @@ type langfuseEvent struct {
 
 type ingestionResponse struct {
 	Successes []struct {
-		ID string `json:"id"`
+		ID     string `json:"id"`
+		Status int    `json:"status"`
 	} `json:"successes"`
 	Errors []struct {
 		ID      string `json:"id"`
+		Status  int    `json:"status"`
 		Message string `json:"message"`
 	} `json:"errors"`
 }
@@ -98,7 +111,22 @@ type ingestionResponse struct {
 type server struct {
 	cfg    config
 	client *http.Client
+	queue  chan langfuseJob
+	ready  func(context.Context) bool
+	wg     sync.WaitGroup
 }
+
+type langfuseJob struct {
+	RequestID string
+	Batch     []any
+}
+
+type retryableError struct {
+	err error
+}
+
+func (e retryableError) Error() string { return e.err.Error() }
+func (e retryableError) Unwrap() error { return e.err }
 
 func main() {
 	cfg, err := loadConfig()
@@ -106,15 +134,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	s := &server{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: cfg.RequestTimeout,
-		},
-	}
+	s := newServer(cfg)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleReady)
 	mux.HandleFunc(cfg.WebhookPath, s.handleApertureWebhook)
 
 	httpServer := &http.Server{Handler: mux}
@@ -122,7 +146,7 @@ func main() {
 	defer stop()
 
 	if cfg.TSNetEnabled {
-		if err := serveTSNet(ctx, cfg, httpServer); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := serveTSNet(ctx, cfg, s, httpServer); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
 		return
@@ -134,19 +158,29 @@ func main() {
 	}
 	log.Printf("relay listening on %s%s", cfg.ListenAddr, cfg.WebhookPath)
 
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-		defer cancel()
-		_ = httpServer.Shutdown(shutdownCtx)
-	}()
-
-	if err := httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := serveHTTP(ctx, cfg, s, httpServer, ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
 
-func serveTSNet(ctx context.Context, cfg config, httpServer *http.Server) error {
+func newServer(cfg config) *server {
+	if cfg.QueueSize <= 0 {
+		cfg.QueueSize = 100
+	}
+	if cfg.WorkerCount <= 0 {
+		cfg.WorkerCount = 2
+	}
+	return &server{
+		cfg: cfg,
+		client: &http.Client{
+			Timeout: cfg.RequestTimeout,
+		},
+		queue: make(chan langfuseJob, cfg.QueueSize),
+		ready: func(context.Context) bool { return true },
+	}
+}
+
+func serveTSNet(ctx context.Context, cfg config, app *server, httpServer *http.Server) error {
 	ts := &tsnet.Server{
 		Hostname: cfg.TSNetHostname,
 		Dir:      cfg.TSNetStateDir,
@@ -154,25 +188,66 @@ func serveTSNet(ctx context.Context, cfg config, httpServer *http.Server) error 
 	}
 	defer ts.Close()
 
-	ln, err := ts.Listen("tcp", cfg.ListenAddr)
+	if err := ensureWritableDir(cfg.TSNetStateDir); err != nil {
+		return err
+	}
+
+	listen := ts.Listen
+	scheme := "http"
+	if cfg.TSNetTLSEnabled {
+		listen = ts.ListenTLS
+		scheme = "https"
+	}
+
+	ln, err := listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
-	log.Printf("relay listening on tailnet at http://%s%s%s", cfg.TSNetHostname, cfg.ListenAddr, cfg.WebhookPath)
+	app.ready = func(ctx context.Context) bool {
+		lc, err := ts.LocalClient()
+		if err != nil {
+			return false
+		}
+		status, err := lc.Status(ctx)
+		return err == nil && status != nil && status.BackendState == "Running"
+	}
+	log.Printf("relay listening on tailnet at %s://%s%s%s", scheme, cfg.TSNetHostname, cfg.ListenAddr, cfg.WebhookPath)
+
+	return serveHTTP(ctx, cfg, app, httpServer, ln)
+}
+
+func serveHTTP(ctx context.Context, cfg config, app *server, httpServer *http.Server, ln net.Listener) error {
+	app.startWorkers()
+	shutdownDone := make(chan struct{})
 
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
+		app.shutdownQueue(shutdownCtx)
+		close(shutdownDone)
 	}()
 
-	return httpServer.Serve(ln)
+	err := httpServer.Serve(ln)
+	if ctx.Err() != nil {
+		<-shutdownDone
+	}
+	return err
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if !s.ready(r.Context()) {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"status":"ready"}`))
 }
 
 func (s *server) handleApertureWebhook(w http.ResponseWriter, r *http.Request) {
@@ -199,14 +274,116 @@ func (s *server) handleApertureWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	batch := buildLangfuseEvents(payload, s.cfg)
-	if err := s.sendToLangfuse(r.Context(), batch); err != nil {
-		log.Printf("langfuse ingestion failed request_id=%s err=%v", payload.Metadata.RequestID, err)
-		http.Error(w, "upstream ingestion failed", http.StatusBadGateway)
+	if err := s.checkBatchSize(batch); err != nil {
+		log.Printf("langfuse batch rejected request_id=%s err=%v", payload.Metadata.RequestID, err)
+		http.Error(w, "payload too large for upstream ingestion", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if !s.enqueue(langfuseJob{RequestID: payload.Metadata.RequestID, Batch: batch}) {
+		http.Error(w, "relay queue full", http.StatusServiceUnavailable)
 		return
 	}
 
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *server) enqueue(job langfuseJob) bool {
+	select {
+	case s.queue <- job:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *server) startWorkers() {
+	for i := 0; i < s.cfg.WorkerCount; i++ {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			for job := range s.queue {
+				if err := s.forwardWithRetry(job); err != nil {
+					log.Printf("langfuse ingestion dropped request_id=%s err=%v", job.RequestID, err)
+				}
+			}
+		}()
+	}
+}
+
+func (s *server) shutdownQueue(ctx context.Context) {
+	close(s.queue)
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		log.Printf("relay shutdown timed out with queued work remaining")
+	}
+}
+
+func (s *server) forwardWithRetry(job langfuseJob) error {
+	attempts := s.cfg.RetryMaxAttempts
+	if attempts <= 0 {
+		attempts = 3
+	}
+	delay := s.cfg.RetryBaseDelay
+	if delay <= 0 {
+		delay = 250 * time.Millisecond
+	}
+	maxDelay := s.cfg.RetryMaxDelay
+	if maxDelay <= 0 {
+		maxDelay = 5 * time.Second
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.RequestTimeout)
+		err := s.sendToLangfuse(ctx, job.Batch)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryable(err) || attempt == attempts {
+			break
+		}
+		time.Sleep(withJitter(delay))
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+	return lastErr
+}
+
+func isRetryable(err error) bool {
+	var retryable retryableError
+	return errors.As(err, &retryable)
+}
+
+func withJitter(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return delay
+	}
+	return delay + time.Duration(mrand.N(int64(delay/2)+1))
+}
+
+func (s *server) checkBatchSize(batch []any) error {
+	if s.cfg.MaxLangfuseBatchBytes <= 0 {
+		return nil
+	}
+	data, err := json.Marshal(langfuseEnvelope{Batch: batch})
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > s.cfg.MaxLangfuseBatchBytes {
+		return fmt.Errorf("batch size %d exceeds max %d", len(data), s.cfg.MaxLangfuseBatchBytes)
+	}
+	return nil
 }
 
 func (s *server) sendToLangfuse(ctx context.Context, batch []any) error {
@@ -225,13 +402,17 @@ func (s *server) sendToLangfuse(ctx context.Context, batch []any) error {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return err
+		return retryableError{err: err}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusMultiStatus {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(msg))
+		err := fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(msg))
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+			return retryableError{err: err}
+		}
+		return err
 	}
 
 	var parsed ingestionResponse
@@ -239,30 +420,39 @@ func (s *server) sendToLangfuse(ctx context.Context, batch []any) error {
 		return err
 	}
 	if len(parsed.Errors) > 0 {
-		return fmt.Errorf("ingestion errors: %+v", parsed.Errors)
+		return fmt.Errorf("ingestion errors: %s", formatIngestionErrors(parsed.Errors, batch))
 	}
 
 	return nil
 }
 
 func buildLangfuseEvents(p aperturePayload, cfg config) []any {
+	traceID, generationID := makeLangfuseIDs(p.Metadata)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	traceID := pick(p.Metadata.RequestID, newID())
-	obsID := pick(p.Metadata.RequestID+"-gen", newID())
 
 	est := p.EstimatedCost
 	if est == nil {
 		est = p.Metadata.EstimatedCost
 	}
 
+	requestBody := rawToAny(p.RequestBody)
+	responseBody := rawToAny(p.ResponseBody)
+	rawResponses := rawToAny(p.RawResponses)
+	toolCalls := rawToAny(p.ToolCalls)
+
 	traceMeta := map[string]any{
-		"provider":       p.Metadata.Provider,
-		"url":            p.Metadata.URL,
-		"tailnet_name":   p.Metadata.TailnetName,
-		"stable_node_id": p.Metadata.StableNodeID,
-		"user_agent":     p.Metadata.UserAgent,
-		"raw_responses":  rawToAny(p.RawResponses),
-		"tool_calls":     rawToAny(p.ToolCalls),
+		"provider":        p.Metadata.Provider,
+		"url":             p.Metadata.URL,
+		"tailnet_name":    p.Metadata.TailnetName,
+		"stable_node_id":  p.Metadata.StableNodeID,
+		"user_agent":      p.Metadata.UserAgent,
+		"request_headers": p.Metadata.RequestHeaders,
+		"user_message":    p.UserMessage,
+		"raw_responses":   rawResponses,
+		"tool_calls":      toolCalls,
+	}
+	if est != nil {
+		traceMeta["estimated_cost"] = est
 	}
 
 	traceBody := map[string]any{
@@ -271,21 +461,21 @@ func buildLangfuseEvents(p aperturePayload, cfg config) []any {
 		"name":        pickNonEmpty("aperture/"+p.Metadata.Provider+"/"+p.Metadata.Model, "aperture/request"),
 		"userId":      p.Metadata.LoginName,
 		"sessionId":   p.Metadata.SessionID,
-		"input":       pickAny(p.UserMessage, rawToAny(p.RequestBody)),
-		"output":      rawToAny(p.ResponseBody),
+		"input":       primaryInput(requestBody, p.UserMessage),
+		"output":      primaryOutput(responseBody, rawResponses),
 		"metadata":    traceMeta,
 		"environment": cfg.LangfuseEnv,
 	}
 
 	genBody := map[string]any{
-		"id":          obsID,
+		"id":          generationID,
 		"traceId":     traceID,
 		"name":        "aperture-generation",
 		"startTime":   now,
 		"endTime":     now,
 		"model":       p.Metadata.Model,
-		"input":       pickAny(p.UserMessage, rawToAny(p.RequestBody)),
-		"output":      rawToAny(p.ResponseBody),
+		"input":       primaryInput(requestBody, p.UserMessage),
+		"output":      primaryOutput(responseBody, rawResponses),
 		"metadata":    traceMeta,
 		"environment": cfg.LangfuseEnv,
 	}
@@ -305,39 +495,135 @@ func buildLangfuseEvents(p aperturePayload, cfg config) []any {
 	}
 }
 
+func makeLangfuseIDs(metadata apertureMetadata) (string, string) {
+	requestID := strings.TrimSpace(metadata.RequestID)
+	if requestID == "" {
+		traceID := newID()
+		return traceID, newID()
+	}
+
+	return deterministicID(requestID, 16), deterministicID(requestID+":generation", 16)
+}
+
+func deterministicID(seed string, size int) string {
+	if size <= 0 {
+		size = 16
+	}
+	sum := sha256.Sum256([]byte(seed))
+	if size > len(sum) {
+		size = len(sum)
+	}
+	return hex.EncodeToString(sum[:size])
+}
+
+func primaryInput(requestBody any, userMessage any) any {
+	return pickAny(requestBody, userMessage)
+}
+
+func primaryOutput(responseBody any, rawResponses any) any {
+	return pickAny(responseBody, rawResponses)
+}
+
+func formatIngestionErrors(errors []struct {
+	ID      string `json:"id"`
+	Status  int    `json:"status"`
+	Message string `json:"message"`
+}, batch []any) string {
+	if len(errors) == 0 {
+		return ""
+	}
+
+	batchIndex := make(map[string]langfuseEvent, len(batch))
+	for _, item := range batch {
+		event, ok := item.(langfuseEvent)
+		if !ok {
+			continue
+		}
+		batchIndex[event.ID] = event
+	}
+
+	details := make([]string, 0, len(errors))
+	for _, item := range errors {
+		detail := fmt.Sprintf("event_id=%s status=%d", item.ID, item.Status)
+		if event, ok := batchIndex[item.ID]; ok {
+			detail = fmt.Sprintf("%s type=%s body_id=%s", detail, event.Type, eventBodyID(event))
+		}
+		if item.Message != "" {
+			detail = fmt.Sprintf("%s message=%s", detail, item.Message)
+		}
+		details = append(details, detail)
+	}
+
+	return strings.Join(details, "; ")
+}
+
+func eventBodyID(event langfuseEvent) string {
+	body, ok := event.Body.(map[string]any)
+	if !ok {
+		return ""
+	}
+	id, _ := body["id"].(string)
+	return id
+}
+
 func (s *server) authorized(r *http.Request) bool {
 	if s.cfg.ApertureAPIKey == "" {
 		return true
 	}
-	if v := r.Header.Get("x-api-key"); v == s.cfg.ApertureAPIKey {
-		return true
-	}
-	if v := r.Header.Get("x-goog-api-key"); v == s.cfg.ApertureAPIKey {
-		return true
-	}
 	auth := r.Header.Get("Authorization")
 	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		return strings.TrimSpace(auth[7:]) == s.cfg.ApertureAPIKey
+		return constantTimeEqual(strings.TrimSpace(auth[7:]), s.cfg.ApertureAPIKey)
 	}
-	return auth == s.cfg.ApertureAPIKey
+	return false
+}
+
+func constantTimeEqual(a, b string) bool {
+	aHash := sha256.Sum256([]byte(a))
+	bHash := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(aHash[:], bHash[:]) == 1 && len(a) == len(b)
+}
+
+func ensureWritableDir(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(path, 0700); err != nil {
+		return err
+	}
+	testFile, err := os.CreateTemp(path, ".write-test-*")
+	if err != nil {
+		return fmt.Errorf("tsnet state dir is not writable: %w", err)
+	}
+	name := testFile.Name()
+	if err := testFile.Close(); err != nil {
+		return err
+	}
+	return os.Remove(name)
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		TSNetEnabled:       readBool("TSNET_ENABLED", true),
-		TSNetHostname:      pick(os.Getenv("TSNET_HOSTNAME"), "aperture-langfuse-relay"),
-		TSNetStateDir:      pick(os.Getenv("TSNET_STATE_DIR"), "./.tsnet"),
-		TSAuthKey:          os.Getenv("TS_AUTHKEY"),
-		ListenAddr:         pick(os.Getenv("LISTEN_ADDR"), ":8080"),
-		WebhookPath:        pick(os.Getenv("WEBHOOK_PATH"), "/hooks/aperture"),
-		ApertureAPIKey:     os.Getenv("APERTURE_API_KEY"),
-		LangfuseBaseURL:    pick(os.Getenv("LANGFUSE_BASE_URL"), "https://cloud.langfuse.com"),
-		LangfusePublicKey:  os.Getenv("LANGFUSE_PUBLIC_KEY"),
-		LangfuseSecretKey:  os.Getenv("LANGFUSE_SECRET_KEY"),
-		LangfuseEnv:        pick(os.Getenv("LANGFUSE_ENV"), "production"),
-		RequestTimeout:     readDuration("REQUEST_TIMEOUT", 15*time.Second),
-		ShutdownTimeout:    readDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
-		MaxRequestBodySize: int64(readInt("MAX_REQUEST_BODY_BYTES", 4*1024*1024)),
+		TSNetEnabled:          readBool("TSNET_ENABLED", true),
+		TSNetTLSEnabled:       readBool("TSNET_TLS_ENABLED", false),
+		TSNetHostname:         pick(os.Getenv("TSNET_HOSTNAME"), "aperture-langfuse-relay"),
+		TSNetStateDir:         pick(os.Getenv("TSNET_STATE_DIR"), "./.tsnet"),
+		TSAuthKey:             os.Getenv("TS_AUTHKEY"),
+		ListenAddr:            pick(os.Getenv("LISTEN_ADDR"), ":8080"),
+		WebhookPath:           pick(os.Getenv("WEBHOOK_PATH"), "/hooks/aperture"),
+		ApertureAPIKey:        os.Getenv("APERTURE_API_KEY"),
+		LangfuseBaseURL:       pick(os.Getenv("LANGFUSE_BASE_URL"), "https://cloud.langfuse.com"),
+		LangfusePublicKey:     os.Getenv("LANGFUSE_PUBLIC_KEY"),
+		LangfuseSecretKey:     os.Getenv("LANGFUSE_SECRET_KEY"),
+		LangfuseEnv:           pick(os.Getenv("LANGFUSE_ENV"), "production"),
+		RequestTimeout:        readDuration("REQUEST_TIMEOUT", 5*time.Second),
+		ShutdownTimeout:       readDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
+		MaxRequestBodySize:    int64(readInt("MAX_REQUEST_BODY_BYTES", 3*1024*1024)),
+		MaxLangfuseBatchBytes: int64(readInt("MAX_LANGFUSE_BATCH_BYTES", 3*1024*1024)),
+		QueueSize:             readInt("QUEUE_SIZE", 100),
+		WorkerCount:           readInt("WORKER_COUNT", 2),
+		RetryMaxAttempts:      readInt("RETRY_MAX_ATTEMPTS", 3),
+		RetryBaseDelay:        readDuration("RETRY_BASE_DELAY", 250*time.Millisecond),
+		RetryMaxDelay:         readDuration("RETRY_MAX_DELAY", 5*time.Second),
 	}
 
 	if cfg.LangfusePublicKey == "" || cfg.LangfuseSecretKey == "" {
@@ -389,7 +675,7 @@ func rawToAny(v json.RawMessage) any {
 
 func newID() string {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := cryptorand.Read(b); err != nil {
 		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)

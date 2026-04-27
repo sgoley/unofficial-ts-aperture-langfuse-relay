@@ -1,0 +1,22 @@
+[Unit]
+Description=Aperture to Langfuse Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aperture-langfuse-relay
+Group=aperture-langfuse-relay
+WorkingDirectory=/opt/aperture-langfuse-relay
+EnvironmentFile=/etc/aperture-langfuse-relay/env
+ExecStart=/usr/local/bin/aperture-langfuse-relay
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aperture-langfuse-relay
+
+[Install]
+WantedBy=multi-user.target
