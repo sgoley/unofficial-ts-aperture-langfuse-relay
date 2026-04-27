@@ -265,6 +265,7 @@ Reference it in your grant capability:
 - `LANGFUSE_SECRET_KEY`: required
 - `LANGFUSE_ENV`: event environment tag
 - `REQUEST_TIMEOUT`: per-attempt Langfuse request timeout, default `5s`
+- `SHUTDOWN_TIMEOUT`: graceful shutdown timeout for HTTP server and workers, default `10s`
 - `MAX_REQUEST_BODY_BYTES`: maximum inbound Aperture payload, default `3145728`
 - `MAX_LANGFUSE_BATCH_BYTES`: maximum generated Langfuse ingestion body, default `3145728`
 - `QUEUE_SIZE`: bounded in-memory queue depth, default `100`
