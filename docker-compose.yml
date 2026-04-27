@@ -1,0 +1,14 @@
+services:
+  aperture-langfuse-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aperture-langfuse-relay:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - tsnet-state:/var/lib/tsnet
+
+volumes:
+  tsnet-state:
