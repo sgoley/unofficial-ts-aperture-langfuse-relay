@@ -2,7 +2,7 @@ module aperture-langfuse-relay
 
 go 1.25.3
 
-require tailscale.com v1.90.2
+require tailscale.com@latest
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect

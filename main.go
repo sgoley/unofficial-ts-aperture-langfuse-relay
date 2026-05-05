@@ -33,6 +33,7 @@ type config struct {
 	TSNetStateDir         string
 	TSAuthKey             string
 	ListenAddr            string
+	HealthListenAddr      string
 	WebhookPath           string
 	ApertureAPIKey        string
 	LangfuseBaseURL       string
@@ -145,21 +146,79 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if cfg.TSNetEnabled {
-		if err := serveTSNet(ctx, cfg, s, httpServer); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
-		}
-		return
+	if err := startLocalHealthServer(ctx, cfg, s); err != nil {
+		log.Fatal(err)
 	}
 
+	// Start workers once
+	s.startWorkers()
+	shutdownDone := make(chan struct{})
+
+	// Shutdown handler
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+		s.shutdownQueue(shutdownCtx)
+		close(shutdownDone)
+	}()
+
+	if cfg.TSNetEnabled {
+		// Start TSNet in a goroutine so we can also listen on Docker network
+		go func() {
+			ts := &tsnet.Server{
+				Hostname: cfg.TSNetHostname,
+				Dir:      cfg.TSNetStateDir,
+				AuthKey:  cfg.TSAuthKey,
+			}
+			defer ts.Close()
+
+			if err := ensureWritableDir(cfg.TSNetStateDir); err != nil {
+				log.Printf("tsnet init error: %v", err)
+				return
+			}
+
+			listen := ts.Listen
+			scheme := "http"
+			if cfg.TSNetTLSEnabled {
+				listen = ts.ListenTLS
+				scheme = "https"
+			}
+
+			ln, err := listen("tcp", cfg.ListenAddr)
+			if err != nil {
+				log.Printf("tsnet listen error: %v", err)
+				return
+			}
+			s.ready = func(ctx context.Context) bool {
+				lc, err := ts.LocalClient()
+				if err != nil {
+					return false
+				}
+				status, err := lc.Status(ctx)
+				return err == nil && status != nil && status.BackendState == "Running"
+			}
+			log.Printf("relay listening on tailnet at %s://%s%s%s", scheme, cfg.TSNetHostname, cfg.ListenAddr, cfg.WebhookPath)
+
+			if err := httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("tsnet serve error: %v", err)
+			}
+		}()
+	}
+
+	// Always listen on regular network (Docker or host)
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("relay listening on %s%s", cfg.ListenAddr, cfg.WebhookPath)
 
-	if err := serveHTTP(ctx, cfg, s, httpServer, ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
+	}
+	if ctx.Err() != nil {
+		<-shutdownDone
 	}
 }
 
@@ -180,60 +239,36 @@ func newServer(cfg config) *server {
 	}
 }
 
-func serveTSNet(ctx context.Context, cfg config, app *server, httpServer *http.Server) error {
-	ts := &tsnet.Server{
-		Hostname: cfg.TSNetHostname,
-		Dir:      cfg.TSNetStateDir,
-		AuthKey:  cfg.TSAuthKey,
-	}
-	defer ts.Close()
-
-	if err := ensureWritableDir(cfg.TSNetStateDir); err != nil {
-		return err
+func startLocalHealthServer(ctx context.Context, cfg config, app *server) error {
+	if strings.TrimSpace(cfg.HealthListenAddr) == "" {
+		return nil
 	}
 
-	listen := ts.Listen
-	scheme := "http"
-	if cfg.TSNetTLSEnabled {
-		listen = ts.ListenTLS
-		scheme = "https"
-	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", app.handleHealth)
+	mux.HandleFunc("/readyz", app.handleReady)
 
-	ln, err := listen("tcp", cfg.ListenAddr)
+	ln, err := net.Listen("tcp", cfg.HealthListenAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to start local health listener on %s: %w", cfg.HealthListenAddr, err)
 	}
-	app.ready = func(ctx context.Context) bool {
-		lc, err := ts.LocalClient()
-		if err != nil {
-			return false
-		}
-		status, err := lc.Status(ctx)
-		return err == nil && status != nil && status.BackendState == "Running"
-	}
-	log.Printf("relay listening on tailnet at %s://%s%s%s", scheme, cfg.TSNetHostname, cfg.ListenAddr, cfg.WebhookPath)
 
-	return serveHTTP(ctx, cfg, app, httpServer, ln)
-}
-
-func serveHTTP(ctx context.Context, cfg config, app *server, httpServer *http.Server, ln net.Listener) error {
-	app.startWorkers()
-	shutdownDone := make(chan struct{})
-
+	server := &http.Server{Handler: mux}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
-		_ = httpServer.Shutdown(shutdownCtx)
-		app.shutdownQueue(shutdownCtx)
-		close(shutdownDone)
+		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	err := httpServer.Serve(ln)
-	if ctx.Err() != nil {
-		<-shutdownDone
-	}
-	return err
+	go func() {
+		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("local health listener stopped: %v", err)
+		}
+	}()
+
+	log.Printf("relay local health listening on http://%s", cfg.HealthListenAddr)
+	return nil
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -251,11 +286,13 @@ func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleApertureWebhook(w http.ResponseWriter, r *http.Request) {
+	log.Printf("webhook received: method=%s auth_header=%v", r.Method, r.Header.Get("Authorization") != "")
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if !s.authorized(r) {
+		log.Printf("webhook unauthorized")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -284,6 +321,7 @@ func (s *server) handleApertureWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("webhook accepted and enqueued: request_id=%s", payload.Metadata.RequestID)
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte("ok"))
 }
@@ -326,6 +364,7 @@ func (s *server) shutdownQueue(ctx context.Context) {
 }
 
 func (s *server) forwardWithRetry(job langfuseJob) error {
+	log.Printf("forwarding to langfuse: request_id=%s batch_size=%d", job.RequestID, len(job.Batch))
 	attempts := s.cfg.RetryMaxAttempts
 	if attempts <= 0 {
 		attempts = 3
@@ -345,12 +384,14 @@ func (s *server) forwardWithRetry(job langfuseJob) error {
 		err := s.sendToLangfuse(ctx, job.Batch)
 		cancel()
 		if err == nil {
+			log.Printf("langfuse ingestion succeeded: request_id=%s", job.RequestID)
 			return nil
 		}
 		lastErr = err
 		if !isRetryable(err) || attempt == attempts {
 			break
 		}
+		log.Printf("langfuse ingestion failed (attempt %d/%d): request_id=%s err=%v", attempt, attempts, job.RequestID, err)
 		time.Sleep(withJitter(delay))
 		delay *= 2
 		if delay > maxDelay {
@@ -609,6 +650,7 @@ func loadConfig() (config, error) {
 		TSNetStateDir:         pick(os.Getenv("TSNET_STATE_DIR"), "./.tsnet"),
 		TSAuthKey:             os.Getenv("TS_AUTHKEY"),
 		ListenAddr:            pick(os.Getenv("LISTEN_ADDR"), ":8080"),
+		HealthListenAddr:      pick(os.Getenv("HEALTH_LISTEN_ADDR"), ":8081"),
 		WebhookPath:           pick(os.Getenv("WEBHOOK_PATH"), "/hooks/aperture"),
 		ApertureAPIKey:        os.Getenv("APERTURE_API_KEY"),
 		LangfuseBaseURL:       pick(os.Getenv("LANGFUSE_BASE_URL"), "https://cloud.langfuse.com"),

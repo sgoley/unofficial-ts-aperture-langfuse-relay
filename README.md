@@ -250,6 +250,8 @@ Reference it in your grant capability:
 ]
 ```
 
+That `send_hooks` entry is only part of the setup: the hook must also be included in a GRANT policy under `app.tailscale.com/cap/aperture`, with `src` scoped to the users/requestors who are allowed to activate it.
+
 ## Environment Variables
 
 - `TSNET_ENABLED`: `true` to run inside tailnet using tsnet
