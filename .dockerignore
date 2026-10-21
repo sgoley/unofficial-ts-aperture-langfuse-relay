@@ -1,5 +1,7 @@
 .git
 .gitignore
+.env
+.env.*
 .DS_Store
 .tsnet
 testdata

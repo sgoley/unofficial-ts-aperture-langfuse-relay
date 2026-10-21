@@ -16,6 +16,7 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -27,6 +28,10 @@ import (
 )
 
 type config struct {
+	RelayMode             string
+	OpenRouterPublicKey   string
+	OpenRouterSecretKey   string
+	OpenRouterMaxInFlight int
 	TSNetEnabled          bool
 	TSNetTLSEnabled       bool
 	TSNetHostname         string
@@ -37,6 +42,7 @@ type config struct {
 	WebhookPath           string
 	ApertureAPIKey        string
 	LangfuseBaseURL       string
+	LangfuseUseTSNet      bool
 	LangfusePublicKey     string
 	LangfuseSecretKey     string
 	LangfuseEnv           string
@@ -110,11 +116,12 @@ type ingestionResponse struct {
 }
 
 type server struct {
-	cfg    config
-	client *http.Client
-	queue  chan langfuseJob
-	ready  func(context.Context) bool
-	wg     sync.WaitGroup
+	cfg        config
+	client     *http.Client
+	queue      chan langfuseJob
+	proxySlots chan struct{}
+	ready      func(context.Context) bool
+	wg         sync.WaitGroup
 }
 
 type langfuseJob struct {
@@ -137,14 +144,36 @@ func main() {
 
 	s := newServer(cfg)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.handleHealth)
-	mux.HandleFunc("/readyz", s.handleReady)
-	mux.HandleFunc(cfg.WebhookPath, s.handleApertureWebhook)
-
-	httpServer := &http.Server{Handler: mux}
+	httpServer := &http.Server{
+		Handler:           s.handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      cfg.RequestTimeout + 10*time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 * 1024,
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	var ts *tsnet.Server
+	if cfg.TSNetEnabled {
+		if err := ensureWritableDir(cfg.TSNetStateDir); err != nil {
+			log.Fatal(err)
+		}
+		ts = &tsnet.Server{Hostname: cfg.TSNetHostname, Dir: cfg.TSNetStateDir, AuthKey: cfg.TSAuthKey}
+		defer ts.Close()
+		if cfg.LangfuseUseTSNet {
+			s.useTailnetDialer(ts.Dial)
+		}
+		// Install readiness before either HTTP listener can serve requests.
+		s.ready = func(ctx context.Context) bool {
+			lc, err := ts.LocalClient()
+			if err != nil {
+				return false
+			}
+			status, err := lc.Status(ctx)
+			return err == nil && status != nil && status.BackendState == "Running"
+		}
+	}
 
 	if err := startLocalHealthServer(ctx, cfg, s); err != nil {
 		log.Fatal(err)
@@ -167,18 +196,6 @@ func main() {
 	if cfg.TSNetEnabled {
 		// Start TSNet in a goroutine so we can also listen on Docker network
 		go func() {
-			ts := &tsnet.Server{
-				Hostname: cfg.TSNetHostname,
-				Dir:      cfg.TSNetStateDir,
-				AuthKey:  cfg.TSAuthKey,
-			}
-			defer ts.Close()
-
-			if err := ensureWritableDir(cfg.TSNetStateDir); err != nil {
-				log.Printf("tsnet init error: %v", err)
-				return
-			}
-
 			listen := ts.Listen
 			scheme := "http"
 			if cfg.TSNetTLSEnabled {
@@ -189,20 +206,14 @@ func main() {
 			ln, err := listen("tcp", cfg.ListenAddr)
 			if err != nil {
 				log.Printf("tsnet listen error: %v", err)
+				stop()
 				return
 			}
-			s.ready = func(ctx context.Context) bool {
-				lc, err := ts.LocalClient()
-				if err != nil {
-					return false
-				}
-				status, err := lc.Status(ctx)
-				return err == nil && status != nil && status.BackendState == "Running"
-			}
-			log.Printf("relay listening on tailnet at %s://%s%s%s", scheme, cfg.TSNetHostname, cfg.ListenAddr, cfg.WebhookPath)
+			log.Printf("relay listening on tailnet at %s://%s%s mode=%s", scheme, cfg.TSNetHostname, cfg.ListenAddr, cfg.RelayMode)
 
 			if err := httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("tsnet serve error: %v", err)
+				stop()
 			}
 		}()
 	}
@@ -212,7 +223,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("relay listening on %s%s", cfg.ListenAddr, cfg.WebhookPath)
+	log.Printf("relay listening on %s mode=%s", cfg.ListenAddr, cfg.RelayMode)
 
 	if err := httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
@@ -229,14 +240,29 @@ func newServer(cfg config) *server {
 	if cfg.WorkerCount <= 0 {
 		cfg.WorkerCount = 2
 	}
+	if cfg.OpenRouterMaxInFlight <= 0 {
+		cfg.OpenRouterMaxInFlight = 8
+	}
 	return &server{
 		cfg: cfg,
 		client: &http.Client{
 			Timeout: cfg.RequestTimeout,
+			// Never send project credentials or ingestion bodies to a redirect target.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		queue: make(chan langfuseJob, cfg.QueueSize),
-		ready: func(context.Context) bool { return true },
+		queue:      make(chan langfuseJob, cfg.QueueSize),
+		proxySlots: make(chan struct{}, cfg.OpenRouterMaxInFlight),
+		ready:      func(context.Context) bool { return true },
 	}
+}
+
+// Opt in to connecting from this relay's own tailnet identity. The ordinary
+// client remains the default so local Docker service names keep working.
+func (s *server) useTailnetDialer(dial func(context.Context, string, string) (net.Conn, error)) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = dial
+	s.client.Transport = transport
 }
 
 func startLocalHealthServer(ctx context.Context, cfg config, app *server) error {
@@ -644,6 +670,10 @@ func ensureWritableDir(path string) error {
 
 func loadConfig() (config, error) {
 	cfg := config{
+		RelayMode:             strings.ToLower(strings.TrimSpace(pick(os.Getenv("RELAY_MODE"), "aperture"))),
+		OpenRouterPublicKey:   os.Getenv("OPENROUTER_RELAY_PUBLIC_KEY"),
+		OpenRouterSecretKey:   os.Getenv("OPENROUTER_RELAY_SECRET_KEY"),
+		OpenRouterMaxInFlight: readInt("OPENROUTER_MAX_IN_FLIGHT", 8),
 		TSNetEnabled:          readBool("TSNET_ENABLED", true),
 		TSNetTLSEnabled:       readBool("TSNET_TLS_ENABLED", false),
 		TSNetHostname:         pick(os.Getenv("TSNET_HOSTNAME"), "aperture-langfuse-relay"),
@@ -654,6 +684,7 @@ func loadConfig() (config, error) {
 		WebhookPath:           pick(os.Getenv("WEBHOOK_PATH"), "/hooks/aperture"),
 		ApertureAPIKey:        os.Getenv("APERTURE_API_KEY"),
 		LangfuseBaseURL:       pick(os.Getenv("LANGFUSE_BASE_URL"), "https://cloud.langfuse.com"),
+		LangfuseUseTSNet:      readBool("LANGFUSE_USE_TSNET", false),
 		LangfusePublicKey:     os.Getenv("LANGFUSE_PUBLIC_KEY"),
 		LangfuseSecretKey:     os.Getenv("LANGFUSE_SECRET_KEY"),
 		LangfuseEnv:           pick(os.Getenv("LANGFUSE_ENV"), "production"),
@@ -671,9 +702,34 @@ func loadConfig() (config, error) {
 	if cfg.LangfusePublicKey == "" || cfg.LangfuseSecretKey == "" {
 		return config{}, errors.New("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY are required")
 	}
+	if cfg.RelayMode != "aperture" && cfg.RelayMode != "openrouter" && cfg.RelayMode != "both" {
+		return config{}, errors.New("RELAY_MODE must be aperture, openrouter, or both")
+	}
+	if cfg.LangfuseUseTSNet && !cfg.TSNetEnabled {
+		return config{}, errors.New("LANGFUSE_USE_TSNET requires TSNET_ENABLED=true")
+	}
+	if cfg.RelayMode != "aperture" && (cfg.OpenRouterPublicKey == "" || cfg.OpenRouterSecretKey == "") {
+		return config{}, errors.New("OPENROUTER_RELAY_PUBLIC_KEY and OPENROUTER_RELAY_SECRET_KEY are required for OpenRouter mode")
+	}
+	if strings.Contains(cfg.OpenRouterPublicKey, ":") {
+		return config{}, errors.New("OPENROUTER_RELAY_PUBLIC_KEY cannot contain a colon")
+	}
+	if cfg.RelayMode == "both" && cfg.ApertureAPIKey == "" {
+		return config{}, errors.New("APERTURE_API_KEY is required when RELAY_MODE=both")
+	}
+	upstream, err := url.Parse(cfg.LangfuseBaseURL)
+	if err != nil || upstream.Host == "" || (upstream.Scheme != "http" && upstream.Scheme != "https") || upstream.User != nil || upstream.RawQuery != "" || upstream.Fragment != "" {
+		return config{}, errors.New("LANGFUSE_BASE_URL must be an http(s) URL without credentials, query, or fragment")
+	}
+	if cfg.RequestTimeout <= 0 || cfg.ShutdownTimeout <= 0 {
+		return config{}, errors.New("REQUEST_TIMEOUT and SHUTDOWN_TIMEOUT must be positive")
+	}
 
 	if !strings.HasPrefix(cfg.WebhookPath, "/") {
 		cfg.WebhookPath = "/" + cfg.WebhookPath
+	}
+	if cfg.WebhookPath == "/" || strings.HasPrefix(cfg.WebhookPath, "/api/") || cfg.WebhookPath == "/healthz" || cfg.WebhookPath == "/readyz" || strings.ContainsAny(cfg.WebhookPath, "?#% \t\r\n{}") {
+		return config{}, errors.New("WEBHOOK_PATH must be a literal path outside /api/, /healthz, and /readyz")
 	}
 
 	return cfg, nil
